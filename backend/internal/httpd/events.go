@@ -4,15 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/cdc"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/requestscope"
 
 	"time"
 )
@@ -21,6 +24,20 @@ const (
 	eventsReplayBatch = 512
 	eventsLiveBuffer  = 1024
 	eventAfterHeader  = "X-AO-Event-After"
+
+	// connectorReplayLimit caps the backlog replayed to a client that reached
+	// the daemon through a connector on this machine — the managed cloudflared
+	// tunnel above all. One replay batch.
+	//
+	// Measured on a busy daemon: a phone returning after an hour asked for a
+	// 12 MB replay, which a quick tunnel cannot stream (Cloudflare documents
+	// Quick Tunnels as not supporting SSE), so the edge cut the stream after
+	// ~30s and the phone reconnected for the same backlog, seven times running,
+	// with every request it made meanwhile starved behind it. A phone on that
+	// path already polls the board and the open conversation, so the skipped
+	// history costs it nothing. The cursor jump is reported in
+	// X-AO-Event-After, the same signal used when a cursor is ahead of head.
+	connectorReplayLimit = eventsReplayBatch
 )
 
 type cdcSubscriber interface {
@@ -32,6 +49,7 @@ type cdcSubscriber interface {
 type EventsController struct {
 	Source cdc.Source
 	Live   cdcSubscriber
+	Log    *slog.Logger
 }
 
 // Register mounts the CDC SSE stream route.
@@ -71,6 +89,11 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 	if startAtHead || after > latestSeq {
 		after = latestSeq
 	}
+	requested := after
+	via := eventsTransport(r)
+	if isConnectorTransport(via) && latestSeq-after > connectorReplayLimit {
+		after = latestSeq - connectorReplayLimit
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -82,6 +105,7 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
+	var overflowed atomic.Bool
 	live := make(chan cdc.Event, eventsLiveBuffer)
 	unsubscribe := c.Live.Subscribe(func(e cdc.Event) {
 		select {
@@ -89,10 +113,25 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 		default:
 			// Never block the broadcaster. Closing the stream is safer than
 			// silently dropping a live event; the client replays on reconnect.
+			overflowed.Store(true)
 			cancel()
 		}
 	})
 	defer unsubscribe()
+
+	stats := eventStreamStats{via: via, requested: requested, start: after, head: latestSeq, opened: time.Now()}
+	c.logger().Info("event stream opened", stats.openAttrs()...)
+	defer func() {
+		switch {
+		case overflowed.Load():
+			stats.end = "live_buffer_overflow"
+		case r.Context().Err() != nil:
+			stats.end = "client_closed"
+		default:
+			stats.end = "write_failed"
+		}
+		c.logger().Info("event stream closed", stats.closeAttrs()...)
+	}()
 
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -111,7 +150,9 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	sentSeq := after
-	if err := c.replay(ctx, w, flusher, &sentSeq); err != nil {
+	replayed, err := c.replay(ctx, w, flusher, &sentSeq)
+	stats.replayed = replayed
+	if err != nil {
 		return
 	}
 
@@ -138,29 +179,40 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case e := <-live:
+			before := sentSeq
 			if err := writeSSEEvent(w, flusher, e, &sentSeq); err != nil {
 				return
+			}
+			if sentSeq != before {
+				stats.live++
 			}
 		}
 	}
 }
 
-func (c *EventsController) replay(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sentSeq *int64) error {
+// replay writes the durable backlog after *sentSeq and reports how many events
+// it sent.
+func (c *EventsController) replay(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sentSeq *int64) (int, error) {
+	sent := 0
 	for {
 		events, err := c.Source.EventsAfter(ctx, *sentSeq, eventsReplayBatch)
 		if err != nil {
-			return err
+			return sent, err
 		}
 		if len(events) == 0 {
-			return nil
+			return sent, nil
 		}
 		for _, e := range events {
+			before := *sentSeq
 			if err := writeSSEEvent(w, flusher, e, sentSeq); err != nil {
-				return err
+				return sent, err
+			}
+			if *sentSeq != before {
+				sent++
 			}
 		}
 		if len(events) < eventsReplayBatch {
-			return nil
+			return sent, nil
 		}
 	}
 }
@@ -200,4 +252,55 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, e cdc.Event, sen
 
 func sseEventName(t cdc.EventType) string {
 	return strings.NewReplacer("\r", "_", "\n", "_").Replace(string(t))
+}
+
+func (c *EventsController) logger() *slog.Logger {
+	return loggerOrDefault(c.Log)
+}
+
+// eventsTransport classifies how a stream request reached the daemon: the
+// desktop's loopback listener, or the LAN listener by its socket peer.
+func eventsTransport(r *http.Request) string {
+	if !requestscope.IsLAN(r.Context()) {
+		return transportLoopback
+	}
+	return peerTransport(r)
+}
+
+func isConnectorTransport(via string) bool {
+	return via == transportCloudflare || via == transportConnector
+}
+
+// eventStreamStats is what the open and close log lines report about one
+// stream: where it came from, how far back it started, and what it carried.
+type eventStreamStats struct {
+	via       string
+	requested int64 // cursor the client asked for, after clamping to head
+	start     int64 // cursor the replay actually started from
+	head      int64
+	opened    time.Time
+	replayed  int
+	live      int
+	end       string
+}
+
+func (s eventStreamStats) openAttrs() []any {
+	return []any{
+		"via", s.via,
+		"after", s.requested,
+		"start", s.start,
+		"head", s.head,
+		"backlog", s.head - s.start,
+		"skipped", s.start - s.requested,
+	}
+}
+
+func (s eventStreamStats) closeAttrs() []any {
+	return []any{
+		"via", s.via,
+		"replayed", s.replayed,
+		"live", s.live,
+		"duration", time.Since(s.opened),
+		"reason", s.end,
+	}
 }

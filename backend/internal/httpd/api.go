@@ -202,7 +202,7 @@ func newAPIWithLogger(cfg config.Config, deps APIDeps, log *slog.Logger) *API {
 		agentAuth:     &controllers.AgentAuthController{Svc: deps.AgentAuth},
 		linkPreview:   &controllers.LinkPreviewController{Svc: deps.LinkPreview},
 		github:        &controllers.GitHubController{Svc: deps.GitHub},
-		events:        &EventsController{Source: deps.CDC, Live: deps.Events},
+		events:        &EventsController{Source: deps.CDC, Live: deps.Events, Log: loggerOrDefault(log)},
 	}
 }
 
