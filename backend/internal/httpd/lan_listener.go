@@ -43,7 +43,7 @@ type LANManager struct {
 func NewLANManager(handler http.Handler, state *authState, defaultPort int, log *slog.Logger, sink ports.EventSink) *LANManager {
 	lock := newLockout(time.Now)
 	return &LANManager{
-		handler:     lanControlBlock(authMiddleware(state, lock, newMobileConnectReporter(sink, time.Now))(handler)),
+		handler:     lanRejectionLog(loggerOrDefault(log), lanControlBlock(authMiddleware(state, lock, newMobileConnectReporter(sink, time.Now))(lanGzip(handler)))),
 		defaultPort: defaultPort,
 		log:         loggerOrDefault(log),
 		state:       state,
@@ -84,6 +84,7 @@ var lanControlBlockedPrefixes = []string{
 func lanControlBlock(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isLANControlBlockedPath(r.URL.Path) || isLANControlBlockedRequest(r.Method, r.URL.Path) {
+			noteLANRejection(r, http.StatusNotFound, "ROUTE_NOT_FOUND")
 			notFoundJSON(w, r)
 			return
 		}
@@ -139,6 +140,7 @@ func expectedHostGuard(hostID string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if expected := r.Header.Get("X-AO-Expected-Host-ID"); expected != "" && expected != hostID {
+				noteLANRejection(r, http.StatusMisdirectedRequest, "HOST_ID_MISMATCH")
 				envelope.WriteAPIError(w, r, http.StatusMisdirectedRequest, "conflict", "HOST_ID_MISMATCH", "This address belongs to another AO host; reconnect to the intended host.", nil)
 				return
 			}

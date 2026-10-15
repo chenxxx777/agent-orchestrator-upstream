@@ -270,6 +270,7 @@ func authMiddleware(state *authState, lock *lockout, connected *mobileConnectRep
 				}
 			}
 			if lock.blocked(src) {
+				noteLANRejection(r, http.StatusTooManyRequests, "LOCKED_OUT")
 				envelope.WriteAPIError(w, r, http.StatusTooManyRequests, "too_many_requests", "LOCKED_OUT",
 					"too many failed attempts; try again shortly", nil)
 				return
@@ -295,8 +296,17 @@ func authMiddleware(state *authState, lock *lockout, connected *mobileConnectRep
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !state.retiredPasswordMatches(tok) {
+			retired := state.retiredPasswordMatches(tok)
+			if !retired {
 				lock.fail(src)
+			}
+			switch {
+			case tok == "":
+				noteLANAuthRejection(r, "missing")
+			case retired:
+				noteLANAuthRejection(r, "retired")
+			default:
+				noteLANAuthRejection(r, "invalid")
 			}
 			envelope.WriteAPIError(w, r, http.StatusUnauthorized, "unauthorized", "BAD_PASSWORD",
 				"missing or invalid connection password", nil)
